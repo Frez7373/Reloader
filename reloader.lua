@@ -1,95 +1,175 @@
--- Reloader - CC:Tweaked factory reset utility
--- Repository: https://github.com/Frez7373/Reloader
--- WARNING: This permanently deletes all user files on the computer.
--- Mounted floppy/disk media is preserved.
+-- Reloader v2 - CC:Tweaked factory reset utility
+-- https://github.com/Frez7373/Reloader
+--
+-- Deletes the complete writable computer filesystem while preserving
+-- read-only/system mounts and external mounted disks.
+--
+-- WARNING: This is destructive. All programs, OS files, startup files,
+-- user data and saved settings on the computer are removed.
 
-term.clear()
-term.setCursorPos(1, 1)
+local function clearScreen()
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+end
 
 local function center(text, y)
-    local w = term.getSize()
+    local w = select(1, term.getSize())
     local x = math.max(1, math.floor((w - #text) / 2) + 1)
     term.setCursorPos(x, y)
     term.write(text)
 end
 
-local w, h = term.getSize()
+local function safeDelete(path)
+    if not fs.exists(path) then
+        return true
+    end
 
+    if fs.isReadOnly(path) then
+        return false, "read-only"
+    end
+
+    local ok, err = pcall(fs.delete, path)
+    if not ok then
+        return false, tostring(err)
+    end
+
+    if fs.exists(path) then
+        return false, "still exists"
+    end
+
+    return true
+end
+
+clearScreen()
+
+local w, h = term.getSize()
 center("RELOADER", 2)
 center("CC:Tweaked Factory Reset", 4)
 
 term.setCursorPos(2, 6)
-term.write("WARNING: ALL USER FILES WILL BE DELETED.")
+term.write("THIS WILL ERASE THE COMPUTER'S INTERNAL FILES.")
 
 term.setCursorPos(2, 8)
-term.write("This includes programs, settings and startup files.")
+term.write("Programs, startup files, settings and user data will be deleted.")
 
 term.setCursorPos(2, 10)
-term.write("Mounted disk/floppy media will NOT be deleted.")
+term.write("External mounted disks such as /disk and /disk1 are preserved.")
 
 term.setCursorPos(2, 12)
-term.write("Type RESET and press Enter to continue:")
+term.write("Type RESET to continue:")
 
 term.setCursorPos(2, 13)
 local answer = read()
 
 if answer ~= "RESET" then
-    term.clear()
-    term.setCursorPos(1, 1)
+    clearScreen()
     print("Factory reset cancelled.")
     return
 end
 
-term.clear()
-term.setCursorPos(1, 1)
-center("Resetting computer...", math.max(1, math.floor(h / 2)))
+clearScreen()
+center("FACTORY RESET", 2)
+term.setCursorPos(1, 4)
+print("Preparing...")
+
+-- Reset CraftOS settings before removing their file.
+pcall(function()
+    settings.clear()
+    settings.save()
+end)
 
 -- Reset the computer label.
 pcall(function()
     os.setComputerLabel(nil)
 end)
 
--- Delete all writable root-level user files/directories.
--- ROM is read-only system content and must remain.
--- disk is external mounted media and is intentionally preserved.
-local protected = {
-    rom = true,
-    disk = true
-}
-
-local items = fs.list("/")
 local failed = {}
+local removed = 0
+local skipped = {}
 
-for _, name in ipairs(items) do
-    if not protected[name] then
-        local ok = pcall(function()
-            fs.delete("/" .. name)
+local function processRoot()
+    local items = fs.list("/")
+    for _, name in ipairs(items) do
+        local path = "/" .. name
+
+        -- ROM is a read-only system mount.
+        -- Preserve all external mounts (/disk, /disk1, etc.) and any other
+        -- mounted root which is not the computer's internal HDD.
+        local drive = nil
+        pcall(function()
+            drive = fs.getDrive(path)
         end)
 
-        if not ok or fs.exists("/" .. name) then
-            table.insert(failed, name)
+        if name == "rom" or drive ~= "hdd" then
+            table.insert(skipped, name)
+        else
+            local ok, err = safeDelete(path)
+
+            if ok then
+                removed = removed + 1
+            else
+                table.insert(failed, name .. " (" .. tostring(err) .. ")")
+            end
         end
     end
 end
 
--- Give the filesystem a moment to settle before rebooting.
-sleep(0.2)
+processRoot()
+
+-- A second pass catches anything which appeared during the first pass.
+-- This also handles files created by a running program.
+local remaining = fs.list("/")
+for _, name in ipairs(remaining) do
+    local path = "/" .. name
+
+    local drive = nil
+    pcall(function()
+        drive = fs.getDrive(path)
+    end)
+
+    if name ~= "rom" and drive == "hdd" then
+        local ok, err = safeDelete(path)
+        if ok then
+            removed = removed + 1
+        else
+            local alreadyFailed = false
+            for _, value in ipairs(failed) do
+                if value:match("^" .. name:gsub("(%W)", "%%%1") .. " ") then
+                    alreadyFailed = true
+                    break
+                end
+            end
+            if not alreadyFailed then
+                table.insert(failed, name .. " (" .. tostring(err) .. ")")
+            end
+        end
+    end
+end
+
+-- Make sure the settings file is gone even if settings.save() recreated it.
+pcall(function()
+    if fs.exists("/.settings") then
+        fs.delete("/.settings")
+    end
+end)
+
+clearScreen()
 
 if #failed > 0 then
-    term.clear()
-    term.setCursorPos(1, 1)
-    print("Factory reset completed with warnings.")
+    center("RESET FINISHED WITH ERRORS", 3)
+    term.setCursorPos(1, 5)
+    print("Removed internal entries: " .. tostring(removed))
     print("")
     print("Could not remove:")
-    for _, name in ipairs(failed) do
-        print(" - " .. name)
+    for _, value in ipairs(failed) do
+        print("  " .. value)
     end
     print("")
     print("Press any key to reboot.")
     os.pullEvent("key")
 else
-    term.clear()
-    term.setCursorPos(1, 1)
     center("FACTORY RESET COMPLETE", math.max(1, math.floor(h / 2)))
     sleep(1)
 end
